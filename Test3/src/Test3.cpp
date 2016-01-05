@@ -10,7 +10,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
-
+#include "libswresample/swresample.h"
 }
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
@@ -34,6 +34,8 @@ typedef struct PacketQueue {
 PacketQueue audioq;
 
 int quit = 0;
+
+struct SwrContext* au_convert_ctx;
 
 void packet_queue_init(PacketQueue *q) {
 	memset(q, 0, sizeof(PacketQueue));
@@ -129,9 +131,12 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 			audio_pkt_size -= len1;
 			data_size = 0;
 			if (got_frame) {
+				swr_convert(au_convert_ctx, &audio_buf, MAX_AUDIO_FRAME_SIZE,
+						(const uint8_t**) frame.data, frame.nb_samples);
+
 				data_size = av_samples_get_buffer_size(NULL,
 						aCodecCtx->channels, frame.nb_samples,
-						aCodecCtx->sample_fmt, 1);
+						AV_SAMPLE_FMT_S16, 1);
 				assert(data_size <= buf_size);
 				memcpy(audio_buf, frame.data[0], data_size);
 			}
@@ -266,6 +271,18 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
+	au_convert_ctx = swr_alloc();
+	uint64_t out_channel_layout = AV_CH_LAYOUT_STEREO;
+	AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_S16;
+	int out_sample_rate = 44100;
+	int64_t in_channel_layout = av_get_default_channel_layout(
+			aCodecCtx->channels);
+	au_convert_ctx = swr_alloc_set_opts(au_convert_ctx, out_channel_layout,
+			out_sample_fmt, out_sample_rate, in_channel_layout,
+			aCodecCtx->sample_fmt, aCodecCtx->sample_rate, 0,
+			NULL);
+	swr_init(au_convert_ctx);
+
 	avcodec_open2(aCodecCtx, aCodec, NULL);
 
 	packet_queue_init(&audioq);
@@ -334,6 +351,7 @@ int main(int argc, char* argv[]) {
 				SDL_RenderClear(render);
 				SDL_RenderCopy(render, texture, NULL, &sdlRect);
 				SDL_RenderPresent(render);
+				SDL_Delay(40);
 				av_free_packet(&packet);
 			}
 		} else if (packet.stream_index == audioStream) {
@@ -348,7 +366,7 @@ int main(int argc, char* argv[]) {
 			break;
 		}
 	}
-
+	swr_free(&au_convert_ctx);
 	av_frame_free(&pFrame);
 	av_frame_free(&pFrameYUV);
 	avcodec_close(pCodecCtxOrig);
