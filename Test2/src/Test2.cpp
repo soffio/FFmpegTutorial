@@ -2,7 +2,7 @@
 // Name        : Test2.cpp
 // Author      : Leon
 // Version     :
-// Copyright   : 
+// Copyright   :
 // Description : Hello World in C++, Ansi-style
 //============================================================================
 
@@ -27,7 +27,6 @@ int main(int argc, char* argv[]) {
 	AVPacket packet;
 	uint8_t* out_buffer;
 	int frameFinished;
-	float aspect_ratio;
 	struct SwsContext* sws_ctx = NULL;
 
 	if (argc < 2) {
@@ -58,7 +57,7 @@ int main(int argc, char* argv[]) {
 	if (videoStream == -1)
 		return -1;
 
-	pCodecCtxOrig = pFormatCtx->streams[i]->codec;
+	pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
 	pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
 	if (pCodec == NULL) {
 		fprintf(stderr, "Unsupported codec!\n");
@@ -76,7 +75,7 @@ int main(int argc, char* argv[]) {
 
 	pFrame = av_frame_alloc();
 	pFrameYUV = av_frame_alloc();
-	out_buffer = av_malloc(
+	out_buffer = (uint8_t*) av_malloc(
 			avpicture_get_size(AV_PIX_FMT_YUV420P, pCodecCtx->width,
 					pCodecCtx->height));
 	avpicture_fill((AVPicture*) pFrameYUV, out_buffer, AV_PIX_FMT_YUV420P,
@@ -86,6 +85,7 @@ int main(int argc, char* argv[]) {
 	SDL_WINDOWPOS_CENTERED,
 	SDL_WINDOWPOS_CENTERED, pCodecCtx->width, pCodecCtx->height,
 			SDL_WINDOW_OPENGL);
+	SDL_Event input;
 
 	if (!screen) {
 		printf("Could not initialize SDL -%s\n", SDL_GetError());
@@ -124,6 +124,11 @@ int main(int argc, char* argv[]) {
 			}
 		}
 		av_free_packet(&packet);
+		if (SDL_PollEvent(&input) > 0) {
+			if (input.type == SDL_QUIT) {
+				break;
+			}
+		}
 	}
 
 	sws_freeContext(sws_ctx);
