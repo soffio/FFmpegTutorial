@@ -112,12 +112,14 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 	static uint8_t* audio_pkt_data = NULL;
 	static int audio_pkt_size = 0;
 	static AVFrame frame;
+	uint64_t dst_channel_layout;
 
 	int len1, data_size = 0;
 
 	for (;;) {
 		printf("audio_decode_frame %d\n", audio_pkt_size);
 		fflush(stdout);
+		// A packet might have more than one frame, so you may have to call it several times to get all the data out of the packet.
 		while (audio_pkt_size > 0) {
 			int got_frame = 0;
 			len1 = avcodec_decode_audio4(aCodecCtx, &frame, &got_frame, &pkt);
@@ -131,14 +133,28 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 			audio_pkt_size -= len1;
 			data_size = 0;
 			if (got_frame) {
-				swr_convert(au_convert_ctx, &audio_buf, MAX_AUDIO_FRAME_SIZE,
-						(const uint8_t**) frame.data, frame.nb_samples);
+				dst_channel_layout =
+						(frame.channel_layout
+								&& frame.channels
+										== av_get_channel_layout_nb_channels(
+												frame.channel_layout)) ?
+								frame.channel_layout :
+								av_get_default_channel_layout(frame.channels);
 
-				data_size = av_samples_get_buffer_size(NULL,
-						aCodecCtx->channels, frame.nb_samples,
-						AV_SAMPLE_FMT_S16, 1);
+				int convert_len = swr_convert(au_convert_ctx, &audio_buf,
+				MAX_AUDIO_FRAME_SIZE, (const uint8_t**) frame.data,
+						frame.nb_samples);
+				data_size = convert_len * frame.channels
+						* av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+
+//				data_size = av_samples_get_buffer_size(NULL, frame.channels,
+//						frame.nb_samples, AV_SAMPLE_FMT_S16, 1);
+				printf("convert_len:%d %d %d\n", convert_len, frame.channels,
+						frame.nb_samples);
+				printf("data_size:%d\n", data_size);
 				assert(data_size <= buf_size);
-				memcpy(audio_buf, frame.data[0], data_size);
+				// We use swr_convert so we don't need to memcpy.
+//				memcpy(audio_buf, frame.data[0], data_size);
 			}
 			if (data_size <= 0) {
 				continue;
@@ -159,15 +175,16 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 	}
 }
 
-void audio_callback(void* userdata, Uint8* stream, int len) {
+void audio_callback(void* userdata, Uint8* stream, int len) { //4096
 	AVCodecContext *aCodecCxt = (AVCodecContext*) userdata;
 	int len1, audio_size;
 	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3 / 2)];
 	static unsigned int audio_buf_size = 0;
 	static unsigned int audio_buf_index = 0;
-
+	printf("audio_callback len:%d\n", len);
 	while (len > 0) {
 		if (audio_buf_index >= audio_buf_size) {
+			/* We have already sent all our data; get more */
 			audio_size = audio_decode_frame(aCodecCxt, audio_buf,
 					sizeof(audio_buf));
 			if (audio_size < 0) {
@@ -258,6 +275,7 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
+	// SDL need sample format AV_SAMPLE_FMT_S16, but FFmpeg output format AV_SAMPLE_FMT_FLTP, so we need convert it.
 	wanted_spec.freq = aCodecCtx->sample_rate;
 	wanted_spec.format = AUDIO_S16SYS;
 	wanted_spec.channels = aCodecCtx->channels;
