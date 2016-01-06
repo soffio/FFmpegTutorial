@@ -63,7 +63,8 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
 	q->last_pkt = pkt1;
 	q->nb_packets++;
 	q->size += pkt1->pkt.size;
-	printf("packet_queue_put return \n");
+	printf("packet_queue_put return q->nb_packets:%d q->size%d\n",
+			q->nb_packets, q->size);
 	fflush(stdout);
 	SDL_CondSignal(q->cond);
 	SDL_UnlockMutex(q->mutex);
@@ -112,7 +113,6 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 	static uint8_t* audio_pkt_data = NULL;
 	static int audio_pkt_size = 0;
 	static AVFrame frame;
-	uint64_t dst_channel_layout;
 
 	int len1, data_size = 0;
 
@@ -133,13 +133,6 @@ int audio_decode_frame(AVCodecContext* aCodecCtx, uint8_t* audio_buf,
 			audio_pkt_size -= len1;
 			data_size = 0;
 			if (got_frame) {
-				dst_channel_layout =
-						(frame.channel_layout
-								&& frame.channels
-										== av_get_channel_layout_nb_channels(
-												frame.channel_layout)) ?
-								frame.channel_layout :
-								av_get_default_channel_layout(frame.channels);
 
 				int convert_len = swr_convert(au_convert_ctx, &audio_buf,
 				MAX_AUDIO_FRAME_SIZE, (const uint8_t**) frame.data,
