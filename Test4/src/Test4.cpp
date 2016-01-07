@@ -60,7 +60,7 @@ typedef struct VideoState {
 	AVStream* video_st;
 	AVCodecContext* video_ctx;
 	PacketQueue videoq;
-	struct SwsContext* sws_cxt;
+	struct SwsContext* sws_ctx;
 
 	VideoPicture pictq[VIDEO_PICTURE_QUEUE_SIZE];
 	int pictq_size, pictq_rindex, pictq_windex;
@@ -84,14 +84,63 @@ void packet_queue_init(PacketQueue* q) {
 	q->cond = SDL_CreateCond();
 }
 
+void alloc_picture(void* userdata) {
+	VideoState* is = (VideoState*) userdata;
+	VideoPicture* vp;
+
+	vp = &is->pictq[is->pictq_windex];
+	vp->width = is->video_st->codec->width;
+	vp->height = is->video_st->codec->height;
+
+}
+
+int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
+	VideoPicture* vp;
+	int dst_pix_fmt;
+	AVPicture pict;
+
+	SDL_LockMutex(is->pictq_mutex);
+	while (is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit) {
+		SDL_CondWait(is->pictq_cond, is->pictq_mutex);
+	}
+	SDL_UnlockMutex(is->pictq_mutex);
+
+	if (is->quit)
+		return -1;
+
+	vp = &is->pictq[is->pictq_windex];
+
+	if (vp->width != is->video_ctx->width
+			|| vp->height != is->video_ctx->height) {
+		SDL_Event event;
+		alloc_picture(is);
+		if (is->quit) {
+			return -1;
+		}
+	}
+
+	sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
+			pFrame->linesize, 0, is->video_st->codec->height, pFrameYUV->data,
+			pFrameYUV->linesize);
+
+	if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
+		is->pictq_windex = 0;
+	}
+	SDL_LockMutex(is->pictq_mutex);
+	is->pictq_size++;
+	SDL_UnlockMutex(is->pictq_mutex);
+
+	return 0;
+}
+
 int video_thread(void* arg) {
 	VideoState* is = (VideoState*) arg;
 	AVPacket pkt1, *packet = &pkt1;
 	int frameFinished;
-	AVFrame* pFrame;
+	AVFrame* pFrame, *pFrameYUV;
 
 	pFrame = av_frame_alloc();
-
+	pFrameYUV = av_frame_alloc();
 	for (;;) {
 		if (packet_queue_get(&is->videoq, packet, 1) < 0) {
 			break;
@@ -101,7 +150,7 @@ int video_thread(void* arg) {
 				packet);
 
 		if (frameFinished) {
-			if (queue_picture(is, pFrame) < 0) {
+			if (queue_picture(is, pFrame, pFrameYUV) < 0) {
 				break;
 			}
 		}
@@ -109,6 +158,7 @@ int video_thread(void* arg) {
 	}
 
 	av_frame_free(&pFrame);
+	av_frame_free(&pFrameYUV);
 	return 0;
 }
 
@@ -174,7 +224,7 @@ int stream_component_open(VideoState* is, int stream_index) {
 
 		packet_queue_init(&is->videoq);
 		is->video_tid=SDL_CreateThread(video_thread,is);
-		is->sws_cxt = sws_getContext(is->video_st->codec->width,
+		is->sws_ctx = sws_getContext(is->video_st->codec->width,
 				is->video_st->codec->height, is->video_st->codec->pix_fmt,
 				is->video_st->codec->width, is->video_st->codec->height,
 				AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
