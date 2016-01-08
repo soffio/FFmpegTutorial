@@ -40,6 +40,7 @@ typedef struct PacketQueue {
 } PacketQueue;
 
 typedef struct VideoPicture {
+	SDL_Texture* bmp;
 	int width, height;
 	int allocated;
 } VideoPicture;
@@ -74,6 +75,10 @@ typedef struct VideoState {
 	int quit;
 } VideoState;
 
+SDL_Window* screen;
+SDL_mutex* screen_mutex;
+SDL_Renderer* render;
+
 /* Since we only have one decoding thread, the Big Struct
  can be global in case we need it. */
 VideoState* global_video_state;
@@ -84,14 +89,84 @@ void packet_queue_init(PacketQueue* q) {
 	q->cond = SDL_CreateCond();
 }
 
+static Uint32 sdl_refresh_timer_cb(Uint32 interval, void* opaue) {
+	SDL_Event event;
+	event.type = FF_REFRESH_EVENT;
+	event.user.data1 = opaue;
+	SDL_PushEvent(&event);
+	return 0;
+}
+
+static void schedule_refresh(VideoState *is, int delay) {
+	SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
+}
+
+void video_display(VideoState* is) {
+	SDL_Rect rect;
+	VideoPicture* vp;
+	float aspect_radio;
+	int w, h, x, y;
+	int i;
+
+	vp = &is->pictq[is->pictq_rindex];
+	if (vp->bmp) {
+		if (is->video_ctx->sample_aspect_ratio == 0) {
+			aspect_radio = 0;
+		} else {
+			aspect_radio = av_q2d(is->video_ctx->sample_aspect_ratio)
+					* is->video_ctx->width / is->video_ctx->height;
+		}
+	}
+}
+
+void video_refresh_timer(void* data) {
+	VideoState* is = (VideoState*) data;
+	VideoPicture* vp;
+
+	if (is->video_st) {
+		if (is->pictq_size == 0) {
+			schedule_refresh(is, 1);
+		} else {
+			vp = &is->pictq[is->pictq_rindex];
+			/* Timing code goes here */
+
+			schedule_refresh(is, 80);
+
+			/* show the picture! */
+			video_display(is);
+
+			if (++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
+				is->pictq_rindex = 0;
+			}
+
+			SDL_LockMutex(is->pictq_mutex);
+			is->pictq_size--;
+			SDL_CondSignal(is->pictq_cond);
+			SDL_UnlockMutex(is->pictq_mutex);
+		}
+	} else {
+		schedule_refresh(is, 100);
+	}
+}
+
 void alloc_picture(void* userdata) {
 	VideoState* is = (VideoState*) userdata;
 	VideoPicture* vp;
 
 	vp = &is->pictq[is->pictq_windex];
+	if (vp->bmp) {
+		SDL_DestroyTexture(vp->bmp);
+	}
+
+	SDL_LockMutex(screen_mutex);
+	vp->bmp = SDL_CreateTexture(render, SDL_PIXELFORMAT_IYUV,
+			SDL_TEXTUREACCESS_STREAMING, is->video_ctx->width,
+			is->video_ctx->height);
+	SDL_UnlockMutex(screen_mutex);
+
 	vp->width = is->video_st->codec->width;
 	vp->height = is->video_st->codec->height;
-
+	vp->allocated = 1;
 }
 
 int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
@@ -315,18 +390,6 @@ int decode_thread(void* arg) {
 	return 0;
 }
 
-static Uint32 sdl_refresh_timer_cb(Uint32 interval, void* opaue) {
-	SDL_Event event;
-	event.type = FF_REFRESH_EVENT;
-	event.user.data1 = opaue;
-	SDL_PushEvent(&event);
-	return 0;
-}
-
-static void schedule_refresh(VideoState *is, int delay) {
-	SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
-}
-
 int main(int argc, char* argv[]) {
 	SDL_Event event;
 	VideoState* is;
@@ -344,12 +407,15 @@ int main(int argc, char* argv[]) {
 		exit(1);
 	}
 
-	SDL_Window* screen = SDL_CreateWindow("Hello World", SDL_WINDOWPOS_CENTERED,
+	screen = SDL_CreateWindow("Hello World", SDL_WINDOWPOS_CENTERED,
 	SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_OPENGL);
 	if (!screen) {
 		printf("Could not initialize SDL -%s\n", SDL_GetError());
 		return -1;
 	}
+	render = SDL_CreateRenderer(screen, -1, 0);
+
+	screen_mutex = SDL_CreateMutex();
 
 	av_strlcpy(is->filename, argv[1], sizeof(is->filename));
 
@@ -363,5 +429,24 @@ int main(int argc, char* argv[]) {
 		av_free(is);
 		return -1;
 	}
+
+	for (;;) {
+		SDL_WaitEvent(&event);
+		switch (event.type) {
+		case FF_QUIT_EVENT:
+		case SDL_QUIT:
+			is->quit = 1;
+			SDL_Quit();
+			return 0;
+			break;
+		case FF_REFRESH_EVENT:
+			video_refresh_time(event.user.data1);
+			break;
+		default:
+			break;
+		}
+	}
+
+	return 0;
 }
 
