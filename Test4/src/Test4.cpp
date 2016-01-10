@@ -11,7 +11,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libavutil/avstring.h>
-
+#include "libswresample/swresample.h"
 }
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
@@ -19,6 +19,10 @@ extern "C" {
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
+
+#include <windows.h>
+
+#include <iostream>
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
 #define MAX_AUDIO_FRAME_SIZE 192000
@@ -31,6 +35,9 @@ extern "C" {
 #define FF_REFRESH_EVENT SDL_USEREVENT
 #define FF_QUIT_EVENT (SDL_USEREVENT+1)
 
+#define WINDOW_WIDTH 640
+#define WINDOW_HEIGHT 480
+
 typedef struct PacketQueue {
 	AVPacketList *first_pkt, *last_pkt;
 	int nb_packets;
@@ -40,6 +47,7 @@ typedef struct PacketQueue {
 } PacketQueue;
 
 typedef struct VideoPicture {
+	AVFrame* pFrameYUV;
 	SDL_Texture* bmp;
 	int width, height;
 	int allocated;
@@ -50,6 +58,7 @@ typedef struct VideoState {
 	int videoStream, audioStream;
 	AVStream *audio_st;
 	AVCodecContext* audio_ctx;
+	SwrContext* au_convert_ctx;
 	PacketQueue audioq;
 	uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
 	unsigned int audio_buf_size;
@@ -89,6 +98,70 @@ void packet_queue_init(PacketQueue* q) {
 	q->cond = SDL_CreateCond();
 }
 
+static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block) {
+	printf("packet_queue_get\n");
+	fflush(stdout);
+	AVPacketList* pkt1;
+	int ret;
+	SDL_LockMutex(q->mutex);
+	for (;;) {
+		if (global_video_state->quit) {
+			ret = -1;
+			break;
+		}
+
+		pkt1 = q->first_pkt;
+		if (pkt1) {
+			q->first_pkt = pkt1->next;
+			if (!q->first_pkt)
+				q->last_pkt = NULL;
+			q->nb_packets--;
+			q->size -= pkt1->pkt.size;
+			*pkt = pkt1->pkt;
+			av_free(pkt1);
+			ret = 1;
+			break;
+		} else if (!block) {
+			ret = 0;
+			break;
+		} else {
+			SDL_CondWait(q->cond, q->mutex);
+		}
+	}
+	printf("packet_queue_get return %d %d\n", ret, pkt->size);
+	fflush(stdout);
+	SDL_UnlockMutex(q->mutex);
+	return ret;
+}
+
+int packet_queue_put(PacketQueue *q, AVPacket *pkt, int video) {
+	AVPacketList* pkt1;
+	if (av_dup_packet(pkt) < 0) {
+		return -1;
+	}
+	pkt1 = (AVPacketList*) av_malloc(sizeof(AVPacketList));
+	if (!pkt1)
+		return -1;
+	pkt1->pkt = *pkt;
+	pkt1->next = NULL;
+
+	SDL_LockMutex(q->mutex);
+
+	if (!q->last_pkt)
+		q->first_pkt = pkt1;
+	else
+		q->last_pkt->next = pkt1;
+	q->last_pkt = pkt1;
+	q->nb_packets++;
+	q->size += pkt1->pkt.size;
+	printf("%s packet_queue_put return q->nb_packets:%d q->size%d\n",
+			video ? "video" : "audio", q->nb_packets, q->size);
+	fflush(stdout);
+	SDL_CondSignal(q->cond);
+	SDL_UnlockMutex(q->mutex);
+	return 0;
+}
+
 static Uint32 sdl_refresh_timer_cb(Uint32 interval, void* opaue) {
 	SDL_Event event;
 	event.type = FF_REFRESH_EVENT;
@@ -110,12 +183,37 @@ void video_display(VideoState* is) {
 
 	vp = &is->pictq[is->pictq_rindex];
 	if (vp->bmp) {
-		if (is->video_ctx->sample_aspect_ratio == 0) {
+		if (is->video_ctx->sample_aspect_ratio.num == 0) {
 			aspect_radio = 0;
 		} else {
 			aspect_radio = av_q2d(is->video_ctx->sample_aspect_ratio)
 					* is->video_ctx->width / is->video_ctx->height;
 		}
+		if (aspect_radio <= 0.0) {
+			aspect_radio = (float) is->video_st->codec->width
+					/ (float) is->video_st->codec->height;
+		}
+		h = WINDOW_HEIGHT;
+		w = ((int) rint(h * aspect_radio)) & -3;
+		if (w > WINDOW_WIDTH) {
+			w = WINDOW_WIDTH;
+			h = ((int) rint(w / aspect_radio)) & -3;
+		}
+		x = (WINDOW_WIDTH - w) / 2;
+		y = (WINDOW_HEIGHT - h) / 2;
+
+		rect.x = x;
+		rect.y = y;
+		rect.w = w;
+		rect.h = h;
+		SDL_LockMutex(screen_mutex);
+		SDL_UpdateYUVTexture(vp->bmp, &rect, vp->pFrameYUV->data[0],
+				vp->pFrameYUV->linesize[0], vp->pFrameYUV->data[1],
+				vp->pFrameYUV->linesize[1], vp->pFrameYUV->data[2],
+				vp->pFrameYUV->linesize[2]);
+		SDL_RenderClear(render);
+		SDL_RenderCopy(render, vp->bmp, NULL, &rect);
+		SDL_RenderPresent(render);
 	}
 }
 
@@ -171,8 +269,6 @@ void alloc_picture(void* userdata) {
 
 int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 	VideoPicture* vp;
-	int dst_pix_fmt;
-	AVPicture pict;
 
 	SDL_LockMutex(is->pictq_mutex);
 	while (is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit) {
@@ -187,7 +283,6 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 
 	if (vp->width != is->video_ctx->width
 			|| vp->height != is->video_ctx->height) {
-		SDL_Event event;
 		alloc_picture(is);
 		if (is->quit) {
 			return -1;
@@ -197,7 +292,7 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 	sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
 			pFrame->linesize, 0, is->video_st->codec->height, pFrameYUV->data,
 			pFrameYUV->linesize);
-
+	vp->pFrameYUV = pFrameYUV;
 	if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
 		is->pictq_windex = 0;
 	}
@@ -237,6 +332,87 @@ int video_thread(void* arg) {
 	return 0;
 }
 
+int audio_decode_frame(VideoState* is, uint8_t* audio_buf, int buf_size) {
+	int len1, data_size = 0;
+	AVPacket *pkt = &is->audio_pkt;
+
+	for (;;) {
+		// A packet might have more than one frame, so you may have to call it several times to get all the data out of the packet.
+		while (is->audio_pkt_size > 0) {
+			int got_frame = 0;
+			len1 = avcodec_decode_audio4(is->audio_ctx, &is->audio_frame,
+					&got_frame, pkt);
+			printf("avcodec_decode_audio4:%d\n", len1);
+			fflush(stdout);
+			if (len1 < 0) {
+				is->audio_pkt_size = 0;
+				break;
+			}
+			is->audio_pkt_data += len1;
+			is->audio_pkt_size -= len1;
+			data_size = 0;
+			if (got_frame) {
+				int convert_len = swr_convert(is->au_convert_ctx, &audio_buf,
+				MAX_AUDIO_FRAME_SIZE, (const uint8_t**) is->audio_frame.data,
+						is->audio_frame.nb_samples);
+				data_size = convert_len * is->audio_frame.channels
+						* av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+
+//				data_size = av_samples_get_buffer_size(NULL, frame.channels,
+//						frame.nb_samples, AV_SAMPLE_FMT_S16, 1);
+				printf("data_size:%d\n", data_size);
+				assert(data_size <= buf_size);
+				// We use swr_convert so we don't need to memcpy.
+//				memcpy(audio_buf, frame.data[0], data_size);
+			}
+			if (data_size <= 0) {
+				continue;
+			}
+			return data_size;
+		}
+		if (pkt->data)
+			av_free_packet(pkt);
+		if (is->quit) {
+			return -1;
+		}
+
+		if (packet_queue_get(&is->audioq, pkt, 1) < 0) {
+			return -1;
+		}
+		is->audio_pkt_data = pkt->data;
+		is->audio_pkt_size = pkt->size;
+	}
+}
+
+void audio_callback(void* userdata, Uint8* stream, int len) {
+	VideoState *is = (VideoState*) userdata;
+	int len1, audio_size;
+	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3 / 2)];
+	static unsigned int audio_buf_size = 0;
+	static unsigned int audio_buf_index = 0;
+	printf("audio_callback len:%d\n", len);
+	while (len > 0) {
+		if (audio_buf_index >= audio_buf_size) {
+			/* We have already sent all our data; get more */
+			audio_size = audio_decode_frame(is, audio_buf, sizeof(audio_buf));
+			if (audio_size < 0) {
+				audio_buf_size = 1024;
+				memset(audio_buf, 0, audio_buf_size);
+			} else {
+				audio_buf_size = audio_size;
+			}
+			audio_buf_index = 0;
+		}
+		len1 = audio_buf_size - audio_buf_index;
+		if (len1 > len)
+			len1 = len;
+		memcpy(stream, (uint8_t *) audio_buf + audio_buf_index, len1);
+		len -= len1;
+		stream += len1;
+		audio_buf_index += len1;
+	}
+}
+
 int stream_component_open(VideoState* is, int stream_index) {
 	AVFormatContext* pFormatCtx = is->pFormatCtx;
 	AVCodecContext* codecCtx;
@@ -274,6 +450,18 @@ int stream_component_open(VideoState* is, int stream_index) {
 			fprintf(stderr, "SDL_OpenAudio: %s\n", SDL_GetError());
 			return -1;
 		}
+
+		is->au_convert_ctx = swr_alloc();
+		uint64_t out_channel_layout = AV_CH_LAYOUT_STEREO;
+		AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_S16;
+		int out_sample_rate = 44100;
+		int64_t in_channel_layout = av_get_default_channel_layout(
+				codecCtx->channels);
+		is->au_convert_ctx = swr_alloc_set_opts(is->au_convert_ctx,
+				out_channel_layout, out_sample_fmt, out_sample_rate,
+				in_channel_layout, codecCtx->sample_fmt, codecCtx->sample_rate,
+				0, NULL);
+		swr_init(is->au_convert_ctx);
 	}
 
 	if (avcodec_open2(codecCtx, codec, NULL) < 0) {
@@ -298,7 +486,7 @@ int stream_component_open(VideoState* is, int stream_index) {
 		is->video_ctx = codecCtx;
 
 		packet_queue_init(&is->videoq);
-		is->video_tid=SDL_CreateThread(video_thread,is);
+		is->video_tid = SDL_CreateThread(video_thread, "video_thread", is);
 		is->sws_ctx = sws_getContext(is->video_st->codec->width,
 				is->video_st->codec->height, is->video_st->codec->pix_fmt,
 				is->video_st->codec->width, is->video_st->codec->height,
@@ -346,7 +534,7 @@ int decode_thread(void* arg) {
 	if (video_index >= 0)
 		stream_component_open(is, video_index);
 
-	// main decode loop
+// main decode loop
 	for (;;) {
 		if (is->quit) {
 			break;
@@ -368,15 +556,15 @@ int decode_thread(void* arg) {
 		}
 
 		if (packet->stream_index == is->videoStream) {
-			packet_queue_put(&is->videoq, packet);
+			packet_queue_put(&is->videoq, packet, 1);
 		} else if (packet->stream_index == is->audioStream) {
-			packet_queue_put(&is->audioq, packet);
+			packet_queue_put(&is->audioq, packet, 0);
 		} else {
 			av_free_packet(packet);
 		}
 	}
 
-	// all done - wait for it
+// all done - wait for it
 	while (!is->quit) {
 		SDL_Delay(100);
 	}
@@ -390,10 +578,21 @@ int decode_thread(void* arg) {
 	return 0;
 }
 
+long WINAPI callback(_EXCEPTION_POINTERS* excp) {
+	printf("Error   address   %x/n", excp->ExceptionRecord->ExceptionAddress);
+	printf("CPU   register:/n");
+	printf("eax   %x   ebx   %x   ecx   %x   edx   %x/n",
+			excp->ContextRecord->Eax, excp->ContextRecord->Ebx,
+			excp->ContextRecord->Ecx, excp->ContextRecord->Edx);
+	fflush(stdout);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int main(int argc, char* argv[]) {
+	SetUnhandledExceptionFilter(callback);
 	SDL_Event event;
-	VideoState* is;
-	is = av_mallocz(sizeof(VideoState));
+	VideoState* is = NULL;
+	is = (VideoState*) av_mallocz(sizeof(VideoState));
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: test <file>\n");
@@ -408,7 +607,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	screen = SDL_CreateWindow("Hello World", SDL_WINDOWPOS_CENTERED,
-	SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_OPENGL);
+	SDL_WINDOWPOS_CENTERED, WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_OPENGL);
 	if (!screen) {
 		printf("Could not initialize SDL -%s\n", SDL_GetError());
 		return -1;
@@ -424,7 +623,7 @@ int main(int argc, char* argv[]) {
 
 	schedule_refresh(is, 40);
 
-	is->parse_tid=SDL_CreateThread(decode_thread,is);
+	is->parse_tid = SDL_CreateThread(decode_thread, "decode_thread", is);
 	if (!is->parse_tid) {
 		av_free(is);
 		return -1;
@@ -440,13 +639,12 @@ int main(int argc, char* argv[]) {
 			return 0;
 			break;
 		case FF_REFRESH_EVENT:
-			video_refresh_time(event.user.data1);
+			video_refresh_timer(event.user.data1);
 			break;
 		default:
 			break;
 		}
 	}
-
 	return 0;
 }
 
