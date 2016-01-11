@@ -19,7 +19,7 @@ extern "C" {
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-
+#include <objbase.h>
 #include <windows.h>
 
 #include <iostream>
@@ -190,8 +190,8 @@ void video_display(VideoState* is) {
 					* is->video_ctx->width / is->video_ctx->height;
 		}
 		if (aspect_radio <= 0.0) {
-			aspect_radio = (float) is->video_st->codec->width
-					/ (float) is->video_st->codec->height;
+			aspect_radio = (float) is->video_ctx->width
+					/ (float) is->video_ctx->height;
 		}
 		h = WINDOW_HEIGHT;
 		w = ((int) rint(h * aspect_radio)) & -3;
@@ -263,8 +263,8 @@ void alloc_picture(void* userdata) {
 			is->video_ctx->height);
 	SDL_UnlockMutex(screen_mutex);
 
-	vp->width = is->video_st->codec->width;
-	vp->height = is->video_st->codec->height;
+	vp->width = is->video_ctx->width;
+	vp->height = is->video_ctx->height;
 	vp->allocated = 1;
 }
 
@@ -299,8 +299,8 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 		fflush(stdout);
 		SDL_LockMutex(screen_mutex);
 		sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
-				pFrame->linesize, 0, is->video_st->codec->height,
-				pFrameYUV->data, pFrameYUV->linesize);
+				pFrame->linesize, 0, is->video_ctx->height, pFrameYUV->data,
+				pFrameYUV->linesize);
 		SDL_UpdateYUVTexture(vp->bmp, NULL, pFrameYUV->data[0],
 				pFrameYUV->linesize[0], pFrameYUV->data[1],
 				pFrameYUV->linesize[1], pFrameYUV->data[2],
@@ -469,6 +469,8 @@ int stream_component_open(VideoState* is, int stream_index) {
 		wanted_spec.userdata = is;
 
 		if (SDL_OpenAudio(&wanted_spec, &spec) < 0) {
+			printf("SDL_OpenAudio error\n");
+			fflush(stdout);
 			fprintf(stderr, "SDL_OpenAudio: %s\n", SDL_GetError());
 			return -1;
 		}
@@ -509,10 +511,10 @@ int stream_component_open(VideoState* is, int stream_index) {
 
 		packet_queue_init(&is->videoq);
 		is->video_tid = SDL_CreateThread(video_thread, "video_thread", is);
-		is->sws_ctx = sws_getContext(is->video_st->codec->width,
-				is->video_st->codec->height, is->video_st->codec->pix_fmt,
-				is->video_st->codec->width, is->video_st->codec->height,
-				AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+		is->sws_ctx = sws_getContext(is->video_ctx->width,
+				is->video_ctx->height, is->video_ctx->pix_fmt,
+				is->video_ctx->width, is->video_ctx->height, AV_PIX_FMT_YUV420P,
+				SWS_BILINEAR, NULL, NULL, NULL);
 		break;
 	default:
 		break;
@@ -520,6 +522,7 @@ int stream_component_open(VideoState* is, int stream_index) {
 }
 
 int decode_thread(void* arg) {
+	CoInitialize(NULL);
 	printf("decode_thread\n");
 	VideoState* is = (VideoState*) arg;
 	AVFormatContext* pFormatCtx;
