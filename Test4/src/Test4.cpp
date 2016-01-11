@@ -47,7 +47,6 @@ typedef struct PacketQueue {
 } PacketQueue;
 
 typedef struct VideoPicture {
-	AVFrame* pFrameYUV;
 	SDL_Texture* bmp;
 	int width, height;
 	int allocated;
@@ -98,8 +97,9 @@ void packet_queue_init(PacketQueue* q) {
 	q->cond = SDL_CreateCond();
 }
 
-static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block) {
-	printf("packet_queue_get\n");
+static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block,
+		int video) {
+	printf("%s packet_queue_get\n", video ? "video" : "audio");
 	fflush(stdout);
 	AVPacketList* pkt1;
 	int ret;
@@ -206,14 +206,12 @@ void video_display(VideoState* is) {
 		rect.y = y;
 		rect.w = w;
 		rect.h = h;
+		printf("x=%d,y=%d,w=%d,h=%d\n", x, y, w, h);
 		SDL_LockMutex(screen_mutex);
-		SDL_UpdateYUVTexture(vp->bmp, &rect, vp->pFrameYUV->data[0],
-				vp->pFrameYUV->linesize[0], vp->pFrameYUV->data[1],
-				vp->pFrameYUV->linesize[1], vp->pFrameYUV->data[2],
-				vp->pFrameYUV->linesize[2]);
 		SDL_RenderClear(render);
 		SDL_RenderCopy(render, vp->bmp, NULL, &rect);
 		SDL_RenderPresent(render);
+		SDL_UnlockMutex(screen_mutex);
 	}
 }
 
@@ -223,12 +221,13 @@ void video_refresh_timer(void* data) {
 
 	if (is->video_st) {
 		if (is->pictq_size == 0) {
+			printf("schedule_refresh(is, 1)\n");
 			schedule_refresh(is, 1);
 		} else {
 			vp = &is->pictq[is->pictq_rindex];
 			/* Timing code goes here */
-
-			schedule_refresh(is, 80);
+			printf("schedule_refresh(is, 40)\n");
+			schedule_refresh(is, 40);
 
 			/* show the picture! */
 			video_display(is);
@@ -243,6 +242,8 @@ void video_refresh_timer(void* data) {
 			SDL_UnlockMutex(is->pictq_mutex);
 		}
 	} else {
+		printf("schedule_refresh(is, 100)\n");
+		fflush(stdout);
 		schedule_refresh(is, 100);
 	}
 }
@@ -269,6 +270,8 @@ void alloc_picture(void* userdata) {
 
 int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 	VideoPicture* vp;
+	printf("queue_picture1\n");
+	fflush(stdout);
 
 	SDL_LockMutex(is->pictq_mutex);
 	while (is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit) {
@@ -280,26 +283,37 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 		return -1;
 
 	vp = &is->pictq[is->pictq_windex];
-
-	if (vp->width != is->video_ctx->width
+	printf("queue_picture2\n");
+	fflush(stdout);
+	if (!vp->bmp || vp->width != is->video_ctx->width
 			|| vp->height != is->video_ctx->height) {
+		vp->allocated = 0;
 		alloc_picture(is);
 		if (is->quit) {
 			return -1;
 		}
 	}
+	fflush(stdout);
+	if (vp->bmp) {
+		printf("vp->bmp not null\n");
+		fflush(stdout);
+		SDL_LockMutex(screen_mutex);
+		sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
+				pFrame->linesize, 0, is->video_st->codec->height,
+				pFrameYUV->data, pFrameYUV->linesize);
+		SDL_UpdateYUVTexture(vp->bmp, NULL, pFrameYUV->data[0],
+				pFrameYUV->linesize[0], pFrameYUV->data[1],
+				pFrameYUV->linesize[1], pFrameYUV->data[2],
+				pFrameYUV->linesize[2]);
+		SDL_UnlockMutex(screen_mutex);
 
-	sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
-			pFrame->linesize, 0, is->video_st->codec->height, pFrameYUV->data,
-			pFrameYUV->linesize);
-	vp->pFrameYUV = pFrameYUV;
-	if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
-		is->pictq_windex = 0;
+		if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
+			is->pictq_windex = 0;
+		}
+		SDL_LockMutex(is->pictq_mutex);
+		is->pictq_size++;
+		SDL_UnlockMutex(is->pictq_mutex);
 	}
-	SDL_LockMutex(is->pictq_mutex);
-	is->pictq_size++;
-	SDL_UnlockMutex(is->pictq_mutex);
-
 	return 0;
 }
 
@@ -308,17 +322,25 @@ int video_thread(void* arg) {
 	AVPacket pkt1, *packet = &pkt1;
 	int frameFinished;
 	AVFrame* pFrame, *pFrameYUV;
+	uint8_t *out_buffer;
 
 	pFrame = av_frame_alloc();
 	pFrameYUV = av_frame_alloc();
+
+	out_buffer = (uint8_t*) av_malloc(
+			avpicture_get_size(AV_PIX_FMT_YUV420P, is->video_ctx->width,
+					is->video_ctx->height));
+	avpicture_fill((AVPicture*) pFrameYUV, out_buffer, AV_PIX_FMT_YUV420P,
+			is->video_ctx->width, is->video_ctx->height);
+
 	for (;;) {
-		if (packet_queue_get(&is->videoq, packet, 1) < 0) {
+		if (packet_queue_get(&is->videoq, packet, 1, 1) < 0) {
 			break;
 		}
 
-		avcodec_decode_video2(is->video_st->codec, pFrame, &frameFinished,
-				packet);
-
+		avcodec_decode_video2(is->video_ctx, pFrame, &frameFinished, packet);
+		printf("queue_picture frameFinished=%d  packet->size=%d\n",
+				frameFinished, packet->size);
 		if (frameFinished) {
 			if (queue_picture(is, pFrame, pFrameYUV) < 0) {
 				break;
@@ -376,7 +398,7 @@ int audio_decode_frame(VideoState* is, uint8_t* audio_buf, int buf_size) {
 			return -1;
 		}
 
-		if (packet_queue_get(&is->audioq, pkt, 1) < 0) {
+		if (packet_queue_get(&is->audioq, pkt, 1, 0) < 0) {
 			return -1;
 		}
 		is->audio_pkt_data = pkt->data;
@@ -498,6 +520,7 @@ int stream_component_open(VideoState* is, int stream_index) {
 }
 
 int decode_thread(void* arg) {
+	printf("decode_thread\n");
 	VideoState* is = (VideoState*) arg;
 	AVFormatContext* pFormatCtx;
 	AVPacket pkt1, *packet = &pkt1;
@@ -508,6 +531,9 @@ int decode_thread(void* arg) {
 
 	global_video_state = is;
 
+	printf("avformat_open_input\n");
+	fflush(stdout);
+
 	if (avformat_open_input(&pFormatCtx, is->filename, NULL, NULL) != 0) {
 		return -1;
 	}
@@ -517,6 +543,8 @@ int decode_thread(void* arg) {
 		return -1;
 	}
 
+	printf("av_dump_format\n");
+	fflush(stdout);
 	av_dump_format(pFormatCtx, 0, is->filename, 0);
 
 	for (i = 0; i < pFormatCtx->nb_streams; i++) {
@@ -547,6 +575,8 @@ int decode_thread(void* arg) {
 			continue;
 		}
 		if (av_read_frame(is->pFormatCtx, packet) < 0) {
+			printf("av_read_frame\n");
+			fflush(stdout);
 			if (is->pFormatCtx->pb->error == 0) {
 				SDL_Delay(100); // no error, wait for user input
 				continue;
@@ -578,18 +608,18 @@ int decode_thread(void* arg) {
 	return 0;
 }
 
-long WINAPI callback(_EXCEPTION_POINTERS* excp) {
-	printf("Error   address   %x/n", excp->ExceptionRecord->ExceptionAddress);
-	printf("CPU   register:/n");
-	printf("eax   %x   ebx   %x   ecx   %x   edx   %x/n",
-			excp->ContextRecord->Eax, excp->ContextRecord->Ebx,
-			excp->ContextRecord->Ecx, excp->ContextRecord->Edx);
+long __stdcall callback(_EXCEPTION_POINTERS* excp) {
+	printf(
+			"An exception occurred which wasn't handled!\nCode: 0x%08X\nAddress: 0x%08X",
+			excp->ExceptionRecord->ExceptionCode,
+			excp->ExceptionRecord->ExceptionAddress);
+
 	fflush(stdout);
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
 int main(int argc, char* argv[]) {
-	SetUnhandledExceptionFilter(callback);
+//	SetUnhandledExceptionFilter(callback);
 	SDL_Event event;
 	VideoState* is = NULL;
 	is = (VideoState*) av_mallocz(sizeof(VideoState));
