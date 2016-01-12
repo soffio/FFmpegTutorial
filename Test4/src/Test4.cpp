@@ -6,6 +6,8 @@
 // Description : Hello World in C++, Ansi-style
 //============================================================================
 
+#define __STDC_CONSTANT_MACROS
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -221,12 +223,10 @@ void video_refresh_timer(void* data) {
 
 	if (is->video_st) {
 		if (is->pictq_size == 0) {
-			printf("schedule_refresh(is, 1)\n");
 			schedule_refresh(is, 1);
 		} else {
 			vp = &is->pictq[is->pictq_rindex];
 			/* Timing code goes here */
-			printf("schedule_refresh(is, 40)\n");
 			schedule_refresh(is, 40);
 
 			/* show the picture! */
@@ -242,8 +242,6 @@ void video_refresh_timer(void* data) {
 			SDL_UnlockMutex(is->pictq_mutex);
 		}
 	} else {
-		printf("schedule_refresh(is, 100)\n");
-		fflush(stdout);
 		schedule_refresh(is, 100);
 	}
 }
@@ -270,8 +268,6 @@ void alloc_picture(void* userdata) {
 
 int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 	VideoPicture* vp;
-	printf("queue_picture1\n");
-	fflush(stdout);
 
 	SDL_LockMutex(is->pictq_mutex);
 	while (is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit) {
@@ -283,8 +279,6 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 		return -1;
 
 	vp = &is->pictq[is->pictq_windex];
-	printf("queue_picture2\n");
-	fflush(stdout);
 	if (!vp->bmp || vp->width != is->video_ctx->width
 			|| vp->height != is->video_ctx->height) {
 		vp->allocated = 0;
@@ -293,10 +287,7 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV) {
 			return -1;
 		}
 	}
-	fflush(stdout);
 	if (vp->bmp) {
-		printf("vp->bmp not null\n");
-		fflush(stdout);
 		SDL_LockMutex(screen_mutex);
 		sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
 				pFrame->linesize, 0, is->video_ctx->height, pFrameYUV->data,
@@ -413,10 +404,13 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 	static unsigned int audio_buf_size = 0;
 	static unsigned int audio_buf_index = 0;
 	printf("audio_callback len:%d\n", len);
+	fflush(stdout);
 	while (len > 0) {
 		if (audio_buf_index >= audio_buf_size) {
 			/* We have already sent all our data; get more */
 			audio_size = audio_decode_frame(is, audio_buf, sizeof(audio_buf));
+			printf("audio_decode_frame audio_size=%d\n", audio_size);
+			fflush(stdout);
 			if (audio_size < 0) {
 				audio_buf_size = 1024;
 				memset(audio_buf, 0, audio_buf_size);
@@ -469,8 +463,6 @@ int stream_component_open(VideoState* is, int stream_index) {
 		wanted_spec.userdata = is;
 
 		if (SDL_OpenAudio(&wanted_spec, &spec) < 0) {
-			printf("SDL_OpenAudio error\n");
-			fflush(stdout);
 			fprintf(stderr, "SDL_OpenAudio: %s\n", SDL_GetError());
 			return -1;
 		}
@@ -522,7 +514,8 @@ int stream_component_open(VideoState* is, int stream_index) {
 }
 
 int decode_thread(void* arg) {
-	CoInitialize(NULL);
+//	CoInitialize(NULL);
+	CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	printf("decode_thread\n");
 	VideoState* is = (VideoState*) arg;
 	AVFormatContext* pFormatCtx;
@@ -534,9 +527,6 @@ int decode_thread(void* arg) {
 
 	global_video_state = is;
 
-	printf("avformat_open_input\n");
-	fflush(stdout);
-
 	if (avformat_open_input(&pFormatCtx, is->filename, NULL, NULL) != 0) {
 		return -1;
 	}
@@ -546,8 +536,6 @@ int decode_thread(void* arg) {
 		return -1;
 	}
 
-	printf("av_dump_format\n");
-	fflush(stdout);
 	av_dump_format(pFormatCtx, 0, is->filename, 0);
 
 	for (i = 0; i < pFormatCtx->nb_streams; i++) {
@@ -568,6 +556,9 @@ int decode_thread(void* arg) {
 // main decode loop
 	for (;;) {
 		if (is->quit) {
+			SDL_LockMutex(is->audioq.mutex);
+			SDL_CondSignal(is->audioq.cond);
+			SDL_UnlockMutex(is->audioq.mutex);
 			break;
 		}
 
