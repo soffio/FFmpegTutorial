@@ -78,7 +78,7 @@ typedef struct VideoState {
 	double frame_timer;
 	double frame_last_pts;
 	double frame_last_delay;
-	double video_clock;
+	double video_clock; //predicted pts of next decoded frame
 	AVStream* video_st;
 	AVCodecContext* video_ctx;
 	PacketQueue videoq;
@@ -234,7 +234,8 @@ double get_audio_clock(VideoState* is) {
 	pts = is->audio_clock;
 	hw_buf_size = is->audio_buf_size - is->audio_buf_index;
 	bytes_per_sec = 0;
-	n = is->audio_st->codec->channels * 2;
+	n = is->audio_st->codec->channels
+			* av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
 	if (is->audio_st) {
 		bytes_per_sec = is->audio_st->codec->sample_rate * n;
 	}
@@ -259,9 +260,11 @@ void video_refresh_timer(void* data) {
 			if (delay <= 0 || delay >= 1.0) {
 				delay = is->frame_last_delay;
 			}
+			/* save for next time */
 			is->frame_last_delay = delay;
 			is->frame_last_pts = vp->pts;
 
+			/* update delay to sync to audio */
 			ref_clock = get_audio_clock(is);
 			diff = vp->pts - ref_clock;
 			sync_threshold =
@@ -274,6 +277,7 @@ void video_refresh_timer(void* data) {
 				}
 			}
 			is->frame_timer += delay;
+			/* computer the REAL delay */
 			actual_delay = is->frame_timer - (av_gettime() / 1000000.0);
 			if (actual_delay < 0.010) {
 				actual_delay = 0.010;
@@ -464,10 +468,13 @@ int audio_decode_frame(VideoState* is, uint8_t* audio_buf, int buf_size,
 
 			pts = is->audio_clock;
 			*pts_ptr = pts;
-			n = 2 * is->audio_ctx->channels;
+			n = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16)
+					* is->audio_ctx->channels;
 			is->audio_clock += (double) data_size
 					/ (double) (n * is->audio_ctx->sample_rate);
-
+			printf("avcodec_decode_audio4 is->audio_clock=%lf\n",
+					(double) data_size
+							/ (double) (n * is->audio_ctx->sample_rate));
 			return data_size;
 		}
 		if (pkt->data)
@@ -484,7 +491,8 @@ int audio_decode_frame(VideoState* is, uint8_t* audio_buf, int buf_size,
 
 		if (pkt->pts != AV_NOPTS_VALUE) {
 			is->audio_clock = av_q2d(is->audio_st->time_base) * pkt->pts;
-			printf("audio packet_queue_get time_base=%lf audio_clock=%lf\n",av_q2d(is->audio_st->time_base), is->audio_clock);
+			printf("audio packet_queue_get time_base=%lf audio_clock=%lf\n",
+					av_q2d(is->audio_st->time_base), is->audio_clock);
 		}
 	}
 }
