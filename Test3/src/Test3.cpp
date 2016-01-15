@@ -5,6 +5,7 @@
 // Copyright   : 
 // Description : Hello World in C++, Ansi-style
 //============================================================================
+#define __STDC_CONSTANT_MACROS
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -349,6 +350,7 @@ int main(int argc, char* argv[]) {
 	i = 0;
 	while (av_read_frame(pFormatCtx, &packet) >= 0) {
 		if (packet.stream_index == videoStream) {
+			printf("packet.size=%d\n",packet.size);
 			avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
 
 			if (frameFinished) {
