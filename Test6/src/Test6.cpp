@@ -222,6 +222,10 @@ double get_video_clock(VideoState* is) {
 	return is->video_current_pts + delta;
 }
 
+double get_external_clock(VideoState* is) {
+	return av_gettime() / 1000000;
+}
+
 double get_master_clock(VideoState* is) {
 	if (is->av_sync_type == AV_SYNC_VIDEO_MASTER) {
 		return get_video_clock(is);
@@ -254,7 +258,7 @@ int synchronize_audio(VideoState* is, short* samples, int sample_size,
 			if (is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
 				is->audio_diff_avg_count++;
 			} else {
-				avg_diff = is->audio_diff_cum(1.0 - is->audio_diff_avg_coef);
+				avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
 				if (fabs(avg_diff) >= is->audio_diff_threshold) {
 					wanted_size = sample_size
 							+ ((int) (diff * is->audio_ctx->sample_rate) * n);
