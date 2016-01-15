@@ -1,9 +1,8 @@
 //============================================================================
-// Name        : Test5.cpp
+// Name        : Test6.cpp
 // Author      : Leon
 // Version     :
 // Copyright   : 
-// Description : Hello World in C++, Ansi-style
 //============================================================================
 
 #define __STDC_CONSTANT_MACROS
@@ -131,6 +130,34 @@ void packet_queue_init(PacketQueue* q) {
 	q->cond = SDL_CreateCond();
 }
 
+int packet_queue_put(PacketQueue *q, AVPacket *pkt, int video) {
+	AVPacketList* pkt1;
+	if (av_dup_packet(pkt) < 0) {
+		return -1;
+	}
+	pkt1 = (AVPacketList*) av_malloc(sizeof(AVPacketList));
+	if (!pkt1)
+		return -1;
+	pkt1->pkt = *pkt;
+	pkt1->next = NULL;
+
+	SDL_LockMutex(q->mutex);
+
+	if (!q->last_pkt)
+		q->first_pkt = pkt1;
+	else
+		q->last_pkt->next = pkt1;
+	q->last_pkt = pkt1;
+	q->nb_packets++;
+	q->size += pkt1->pkt.size;
+	printf("%s packet_queue_put return q->nb_packets:%d q->size%d\n",
+			video ? "video" : "audio", q->nb_packets, q->size);
+	fflush(stdout);
+	SDL_CondSignal(q->cond);
+	SDL_UnlockMutex(q->mutex);
+	return 0;
+}
+
 static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block,
 		int video) {
 	printf("%s packet_queue_get\n", video ? "video" : "audio");
@@ -168,34 +195,6 @@ static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block,
 	return ret;
 }
 
-int packet_queue_put(PacketQueue *q, AVPacket *pkt, int video) {
-	AVPacketList* pkt1;
-	if (av_dup_packet(pkt) < 0) {
-		return -1;
-	}
-	pkt1 = (AVPacketList*) av_malloc(sizeof(AVPacketList));
-	if (!pkt1)
-		return -1;
-	pkt1->pkt = *pkt;
-	pkt1->next = NULL;
-
-	SDL_LockMutex(q->mutex);
-
-	if (!q->last_pkt)
-		q->first_pkt = pkt1;
-	else
-		q->last_pkt->next = pkt1;
-	q->last_pkt = pkt1;
-	q->nb_packets++;
-	q->size += pkt1->pkt.size;
-	printf("%s packet_queue_put return q->nb_packets:%d q->size%d\n",
-			video ? "video" : "audio", q->nb_packets, q->size);
-	fflush(stdout);
-	SDL_CondSignal(q->cond);
-	SDL_UnlockMutex(q->mutex);
-	return 0;
-}
-
 double get_audio_clock(VideoState* is) {
 	double pts;
 	int hw_buf_size, bytes_per_sec, n;
@@ -223,7 +222,7 @@ double get_video_clock(VideoState* is) {
 }
 
 double get_external_clock(VideoState* is) {
-	return av_gettime() / 1000000;
+	return av_gettime() / 1000000.0;
 }
 
 double get_master_clock(VideoState* is) {
@@ -375,16 +374,18 @@ void video_refresh_timer(void* data) {
 			is->frame_last_delay = delay;
 			is->frame_last_pts = vp->pts;
 
-			/* update delay to sync to audio */
-			ref_clock = get_audio_clock(is);
-			diff = vp->pts - ref_clock;
-			sync_threshold =
-					(delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
-			if (fabs(diff) < AV_NOSYNC_THRESHOLD) {
-				if (diff <= -sync_threshold) {
-					delay = 0;
-				} else if (diff >= sync_threshold) {
-					delay = 2 * delay;
+			/* update delay to sync to audio if not master source*/
+			if (is->av_sync_type != AV_SYNC_VIDEO_MASTER) {
+				ref_clock = get_audio_clock(is);
+				diff = vp->pts - ref_clock;
+				sync_threshold =
+						(delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+				if (fabs(diff) < AV_NOSYNC_THRESHOLD) {
+					if (diff <= -sync_threshold) {
+						delay = 0;
+					} else if (diff >= sync_threshold) {
+						delay = 2 * delay;
+					}
 				}
 			}
 			is->frame_timer += delay;
@@ -626,6 +627,8 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 				is->audio_buf_size = 1024;
 				memset(is->audio_buf, 0, is->audio_buf_size);
 			} else {
+				audio_size = synchronize_audio(is, (int16_t *) is->audio_buf,
+						audio_size, pts);
 				is->audio_buf_size = audio_size;
 			}
 			is->audio_buf_index = 0;
