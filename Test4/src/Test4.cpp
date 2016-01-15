@@ -3,7 +3,6 @@
 // Author      : Leon
 // Version     :
 // Copyright   : 
-// Description : Hello World in C++, Ansi-style
 //============================================================================
 
 #define __STDC_CONSTANT_MACROS
