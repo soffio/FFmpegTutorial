@@ -643,10 +643,22 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 	}
 }
 
+void Hex2Str(const uint8_t *sSrc, int x) {
+	int i;
+	for (i = 0; i < x; i++) {
+		if (i > 0)
+			printf(" ");
+		printf("%02X", sSrc[i]);
+	}
+	printf("\n");
+	return;
+}
+
 int stream_component_open(VideoState* is, int stream_index) {
 	AVFormatContext* pFormatCtx = is->pFormatCtx;
 	AVCodecContext* codecCtx;
 	AVCodec* codec;
+
 	SDL_AudioSpec wanted_spec, spec;
 
 	if (stream_index < 0 || stream_index >= pFormatCtx->nb_streams) {
@@ -699,7 +711,6 @@ int stream_component_open(VideoState* is, int stream_index) {
 		fprintf(stderr, "Unsupported codec!\n");
 		return -1;
 	}
-
 	switch (codecCtx->codec_type) {
 	case AVMEDIA_TYPE_AUDIO:
 		is->audioStream = stream_index;
@@ -715,6 +726,8 @@ int stream_component_open(VideoState* is, int stream_index) {
 		is->videoStream = stream_index;
 		is->video_st = pFormatCtx->streams[stream_index];
 		is->video_ctx = codecCtx;
+		Hex2Str(codecCtx->extradata, codecCtx->extradata_size);
+		printf("AVCodecID:%d\n",codec->id);
 
 		is->frame_timer = (double) av_gettime() / 1000000.0;
 		is->frame_last_delay = 40e-3;
