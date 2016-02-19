@@ -71,6 +71,9 @@ typedef struct VideoState {
 	int av_sync_type;
 	double external_clock;
 	int64_t external_clock_time;
+	int seek_req;
+	int seek_flags;
+	int64_t seek_pos;
 
 	double audio_clock;
 	AVStream *audio_st;
@@ -123,6 +126,7 @@ SDL_Renderer* render;
 /* Since we only have one decoding thread, the Big Struct
  can be global in case we need it. */
 VideoState* global_video_state;
+AVPacket flush_pkt;
 
 void packet_queue_init(PacketQueue* q) {
 	memset(q, 0, sizeof(PacketQueue));
@@ -132,7 +136,7 @@ void packet_queue_init(PacketQueue* q) {
 
 int packet_queue_put(PacketQueue *q, AVPacket *pkt, int video) {
 	AVPacketList* pkt1;
-	if (av_dup_packet(pkt) < 0) {
+	if (pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
 		return -1;
 	}
 	pkt1 = (AVPacketList*) av_malloc(sizeof(AVPacketList));
@@ -193,6 +197,22 @@ static int packet_queue_get(PacketQueue *q, AVPacket* pkt, int block,
 	fflush(stdout);
 	SDL_UnlockMutex(q->mutex);
 	return ret;
+}
+
+static void packet_queue_flush(PacketQueue* q) {
+	AVPacketList *pkt, *pkt1;
+
+	SDL_LockMutex(q->mutex);
+	for (pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
+		pkt1 = pkt->next;
+		av_free_packet(&pkt->pkt);
+		av_freep(&pkt);
+	}
+	q->last_pkt = NULL;
+	q->first_pkt = NULL;
+	q->nb_packets = 0;
+	q->size = 0;
+	SDL_UnlockMutex(q->mutex);
 }
 
 double get_audio_clock(VideoState* is) {
@@ -514,6 +534,11 @@ int video_thread(void* arg) {
 			break;
 		}
 
+		if (packet->data == flush_pkt.data) {
+			avcodec_flush_buffers(is->video_ctx);
+			continue;
+		}
+
 		pts = 0;
 		avcodec_decode_video2(is->video_ctx, pFrame, &frameFinished, packet);
 
@@ -597,6 +622,10 @@ int audio_decode_frame(VideoState* is, uint8_t* audio_buf, int buf_size,
 
 		if (packet_queue_get(&is->audioq, pkt, 1, 0) < 0) {
 			return -1;
+		}
+		if (pkt->data == flush_pkt.data) {
+			avcodec_flush_buffers(is->audio_ctx);
+			continue;
 		}
 		is->audio_pkt_data = pkt->data;
 		is->audio_pkt_size = pkt->size;
@@ -727,7 +756,7 @@ int stream_component_open(VideoState* is, int stream_index) {
 		is->video_st = pFormatCtx->streams[stream_index];
 		is->video_ctx = codecCtx;
 		Hex2Str(codecCtx->extradata, codecCtx->extradata_size);
-		printf("AVCodecID:%d\n",codec->id);
+		printf("AVCodecID:%d\n", codec->id);
 
 		is->frame_timer = (double) av_gettime() / 1000000.0;
 		is->frame_last_delay = 40e-3;
@@ -800,6 +829,32 @@ int decode_thread(void* arg) {
 		}
 
 		//seek stuff goes here
+		if (is->seek_req) {
+			int stream_index = -1;
+			int64_t seek_target = is->seek_pos;
+			if (is->videoStream >= 0)
+				stream_index = is->videoStream;
+			else if (is->audioStream >= 0)
+				stream_index = is->audioStream;
+
+			if (stream_index >= 0) {
+				seek_target = av_rescale_q(seek_target, AV_TIME_BASE_Q,
+						pFormatCtx->streams[stream_index]->time_base);
+			}
+
+			if (av_seek_frame(is->pFormatCtx, stream_index, seek_target,
+					is->seek_flags) < 0) {
+				fprintf(stderr, "%s: error while seeking\n",
+						is->pFormatCtx->filename);
+			} else {
+				if (is->audioStream >= 0) {
+					packet_queue_flush(&is->audioq);
+					packet_queue_put(&is->audioq, &flush_pkt, 0);
+				}
+			}
+			is->seek_req = 0;
+		}
+
 		if (is->audioq.size > MAX_AUDIOQ_SIZE
 				|| is->videoq.size > MAX_AUDIOQ_SIZE) {
 			SDL_Delay(10);
@@ -849,6 +904,14 @@ long __stdcall callback(_EXCEPTION_POINTERS* excp) {
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
+void stream_seek(VideoState* is, int64_t pos, int rel) {
+	if (!is->seek_req) {
+		is->seek_pos = pos;
+		is->seek_flags = rel < 0 ? AVSEEK_FLAG_BACKWARD : 0;
+		is->seek_req = 1;
+	}
+}
+
 int main(int argc, char* argv[]) {
 //	SetUnhandledExceptionFilter(callback);
 	SDL_Event event;
@@ -891,9 +954,38 @@ int main(int argc, char* argv[]) {
 		return -1;
 	}
 
+	av_init_packet(&flush_pkt);
+	flush_pkt.data = (unsigned char*) "FLUSH";
+
 	for (;;) {
+		double incr, pos;
 		SDL_WaitEvent(&event);
 		switch (event.type) {
+		case SDL_KEYDOWN:
+			switch (event.key.keysym.sym) {
+			case SDLK_LEFT:
+				incr = -10.0;
+				goto do_seek;
+			case SDLK_RIGHT:
+				incr = 10.0;
+				goto do_seek;
+			case SDLK_UP:
+				incr = 60.0;
+				goto do_seek;
+			case SDLK_DOWN:
+				incr = -60.0;
+				goto do_seek;
+				do_seek: if (global_video_state) {
+					pos = get_master_clock(global_video_state);
+					pos += incr;
+					stream_seek(global_video_state,
+							(int64_t) (pos * AV_TIME_BASE), incr);
+				}
+				break;
+			default:
+				break;
+			}
+			break;
 		case FF_QUIT_EVENT:
 		case SDL_QUIT:
 			is->quit = 1;
