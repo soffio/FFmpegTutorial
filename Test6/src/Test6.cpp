@@ -58,9 +58,7 @@ typedef struct PacketQueue {
 } PacketQueue;
 
 typedef struct VideoPicture {
-	SDL_Texture* bmp;
 	int width, height;
-	int allocated;
 	double pts;
 } VideoPicture;
 
@@ -107,6 +105,8 @@ typedef struct VideoState {
 
 	SDL_Thread* parse_tid;
 	SDL_Thread* video_tid;
+
+	SDL_Texture* bmp;
 
 	char filename[1024];
 	int quit;
@@ -319,37 +319,35 @@ void video_display(VideoState* is) {
 	int w, h, x, y;
 
 	vp = &is->pictq[is->pictq_rindex];
-	if (vp->bmp) {
-		if (is->video_ctx->sample_aspect_ratio.num == 0) {
-			aspect_radio = 0;
-		} else {
-			aspect_radio = av_q2d(is->video_ctx->sample_aspect_ratio)
-					* is->video_ctx->width / is->video_ctx->height;
-		}
-		if (aspect_radio <= 0.0) {
-			aspect_radio = (float) is->video_ctx->width
-					/ (float) is->video_ctx->height;
-		}
-		h = WINDOW_HEIGHT;
-		w = ((int) rint(h * aspect_radio)) & -3;
-		if (w > WINDOW_WIDTH) {
-			w = WINDOW_WIDTH;
-			h = ((int) rint(w / aspect_radio)) & -3;
-		}
-		x = (WINDOW_WIDTH - w) / 2;
-		y = (WINDOW_HEIGHT - h) / 2;
-
-		rect.x = x;
-		rect.y = y;
-		rect.w = w;
-		rect.h = h;
-		printf("x=%d,y=%d,w=%d,h=%d\n", x, y, w, h);
-		SDL_LockMutex(screen_mutex);
-		SDL_RenderClear(render);
-		SDL_RenderCopy(render, vp->bmp, NULL, &rect);
-		SDL_RenderPresent(render);
-		SDL_UnlockMutex(screen_mutex);
+	if (is->video_ctx->sample_aspect_ratio.num == 0) {
+		aspect_radio = 0;
+	} else {
+		aspect_radio = av_q2d(is->video_ctx->sample_aspect_ratio)
+				* is->video_ctx->width / is->video_ctx->height;
 	}
+	if (aspect_radio <= 0.0) {
+		aspect_radio = (float) is->video_ctx->width
+				/ (float) is->video_ctx->height;
+	}
+	h = WINDOW_HEIGHT;
+	w = ((int) rint(h * aspect_radio)) & -3;
+	if (w > WINDOW_WIDTH) {
+		w = WINDOW_WIDTH;
+		h = ((int) rint(w / aspect_radio)) & -3;
+	}
+	x = (WINDOW_WIDTH - w) / 2;
+	y = (WINDOW_HEIGHT - h) / 2;
+
+	rect.x = x;
+	rect.y = y;
+	rect.w = w;
+	rect.h = h;
+	printf("x=%d,y=%d,w=%d,h=%d\n", x, y, w, h);
+	SDL_LockMutex(screen_mutex);
+	SDL_RenderClear(render);
+	SDL_RenderCopy(render, is->bmp, NULL, &rect);
+	SDL_RenderPresent(render);
+	SDL_UnlockMutex(screen_mutex);
 }
 
 void video_refresh_timer(void* data) {
@@ -415,22 +413,13 @@ void video_refresh_timer(void* data) {
 
 void alloc_picture(void* userdata) {
 	VideoState* is = (VideoState*) userdata;
-	VideoPicture* vp;
-
-	vp = &is->pictq[is->pictq_windex];
-	if (vp->bmp) {
-		SDL_DestroyTexture(vp->bmp);
-	}
 
 	SDL_LockMutex(screen_mutex);
-	vp->bmp = SDL_CreateTexture(render, SDL_PIXELFORMAT_IYUV,
+	is->bmp = SDL_CreateTexture(render, SDL_PIXELFORMAT_IYUV,
 			SDL_TEXTUREACCESS_STREAMING, is->video_ctx->width,
 			is->video_ctx->height);
 	SDL_UnlockMutex(screen_mutex);
 
-	vp->width = is->video_ctx->width;
-	vp->height = is->video_ctx->height;
-	vp->allocated = 1;
 }
 
 int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV,
@@ -447,33 +436,25 @@ int queue_picture(VideoState* is, AVFrame* pFrame, AVFrame* pFrameYUV,
 		return -1;
 
 	vp = &is->pictq[is->pictq_windex];
-	if (!vp->bmp || vp->width != is->video_ctx->width
-			|| vp->height != is->video_ctx->height) {
-		vp->allocated = 0;
-		alloc_picture(is);
-		if (is->quit) {
-			return -1;
-		}
-	}
-	if (vp->bmp) {
-		SDL_LockMutex(screen_mutex);
-		vp->pts = pts;
-		sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
-				pFrame->linesize, 0, is->video_ctx->height, pFrameYUV->data,
-				pFrameYUV->linesize);
-		SDL_UpdateYUVTexture(vp->bmp, NULL, pFrameYUV->data[0],
-				pFrameYUV->linesize[0], pFrameYUV->data[1],
-				pFrameYUV->linesize[1], pFrameYUV->data[2],
-				pFrameYUV->linesize[2]);
-		SDL_UnlockMutex(screen_mutex);
+	vp->width = is->video_ctx->width;
+	vp->height = is->video_ctx->height;
 
-		if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
-			is->pictq_windex = 0;
-		}
-		SDL_LockMutex(is->pictq_mutex);
-		is->pictq_size++;
-		SDL_UnlockMutex(is->pictq_mutex);
+	SDL_LockMutex(screen_mutex);
+	vp->pts = pts;
+	sws_scale(is->sws_ctx, (const uint8_t* const *) pFrame->data,
+			pFrame->linesize, 0, is->video_ctx->height, pFrameYUV->data,
+			pFrameYUV->linesize);
+	SDL_UpdateYUVTexture(is->bmp, NULL, pFrameYUV->data[0],
+			pFrameYUV->linesize[0], pFrameYUV->data[1], pFrameYUV->linesize[1],
+			pFrameYUV->data[2], pFrameYUV->linesize[2]);
+	SDL_UnlockMutex(screen_mutex);
+
+	if (++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
+		is->pictq_windex = 0;
 	}
+	SDL_LockMutex(is->pictq_mutex);
+	is->pictq_size++;
+	SDL_UnlockMutex(is->pictq_mutex);
 	return 0;
 }
 
@@ -499,6 +480,8 @@ int video_thread(void* arg) {
 	AVFrame* pFrame, *pFrameYUV;
 	uint8_t *out_buffer;
 	double pts;
+
+	alloc_picture(is);
 
 	pFrame = av_frame_alloc();
 	pFrameYUV = av_frame_alloc();
